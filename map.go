@@ -1,55 +1,57 @@
 package expireMap
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
 func New[T any](size int, expire time.Duration) *Map[T] {
-	return &Map[T]{
-		values: make(map[string]*ele[T], size),
-		expire: expire,
-	}
+	return (&Map[T]{expire: expire}).init(size)
 }
 
 type Map[T any] struct {
-	values map[string]*ele[T]
-	expire time.Duration
-	lock   sync.RWMutex
+	values  map[string]T
+	cancels map[string]context.CancelFunc
+	expire  time.Duration
+	ctx     context.Context
+	cancel  context.CancelFunc
+	lock    sync.RWMutex
+}
+
+func (m *Map[T]) init(size int) *Map[T] {
+	m.values = make(map[string]T, size)
+	m.cancels = make(map[string]context.CancelFunc, size)
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	return m
+}
+
+func (m *Map[T]) Set(key string, value T) (T, bool) {
+	return m.SetWithExpire(key, value, m.expire)
+}
+
+func (m *Map[T]) Get(key string) (v T, b bool) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	v, b = m.values[key]
+	return
 }
 
 func (m *Map[T]) Del(key string) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	if old, ok := m.values[key]; ok {
-		old.stop()
+	if cancel, ok := m.cancels[key]; ok {
+		delete(m.cancels, key)
 		delete(m.values, key)
+		cancel()
 	}
 }
 
-func (m *Map[T]) Get(key string) (T, bool) {
+func (m *Map[T]) Exist(key string) (b bool) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
-	var v T
-	if value, ok := m.values[key]; ok {
-		value.refresh()
-		return value.v, ok
-	}
-	return v, false
-}
-
-func (m *Map[T]) Set(key string, value T) (T, bool) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	if old, ok := m.values[key]; ok {
-		old.refresh()
-		return old.v, false
-	} else {
-		e := NewEle(value)
-		m.values[key] = e
-		go e.run(key, m.expire, m)
-		return value, true
-	}
+	_, b = m.values[key]
+	return
 }
 
 func (m *Map[T]) Size() int {
@@ -58,42 +60,18 @@ func (m *Map[T]) Size() int {
 	return len(m.values)
 }
 
-func (m *Map[T]) expired(key string) {
+func (m *Map[T]) SetWithExpire(key string, value T, expire time.Duration) (T, bool) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	delete(m.values, key)
-}
-
-func NewEle[T any](value T) *ele[T] {
-	return &ele[T]{v: value, s: make(chan string, 2)}
-}
-
-type ele[T any] struct {
-	v T
-	s chan string
-}
-
-func (e *ele[T]) stop() {
-	e.s <- "s"
-}
-
-func (e *ele[T]) refresh() {
-	e.s <- "r"
-}
-
-func (e *ele[T]) run(key string, expire time.Duration, m *Map[T]) {
-	timer := time.NewTimer(expire)
-	defer timer.Stop()
-	for {
-		select {
-		case s := <-e.s:
-			if s == "s" {
-				return
-			}
-		case <-timer.C:
-			m.expired(key)
-			return
-		}
-		timer.Reset(expire)
+	if v, ok := m.values[key]; ok {
+		return v, false
 	}
+	ctx, cancel := context.WithTimeout(m.ctx, expire)
+	m.cancels[key] = cancel
+	m.values[key] = value
+	go func() {
+		<-ctx.Done()
+		m.Del(key)
+	}()
+	return value, true
 }
